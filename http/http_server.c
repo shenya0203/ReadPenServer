@@ -52,6 +52,8 @@ extern int h_errno;
 #define DIR_MODE 0666
 
 
+
+
 #ifdef DEBUG
 #define http_log(fmt, ...) \
 do {\
@@ -73,6 +75,9 @@ int writeblock(char *filepath, char *mount_point, unsigned long int offset, unsi
 	int i = 0;	
 	char realpathp[256];
 	long int x;
+	char *endptr;
+	unsigned char w;
+	int rc;
 	
 	//拼接文件路径
 	strcpy(realpathp, mount_point);
@@ -85,21 +90,17 @@ int writeblock(char *filepath, char *mount_point, unsigned long int offset, unsi
 		return -1;
 	}
 
-	fseek(fp, 0, SEEK_END);
-	
-	f_len = ftell(fp);
-		
-	if (f_len < offset) {
-		http_log("offset is invalid!!!\n");
-		fclose(fp);
-		return -1;
-	}
+	rc = fseek(fp, offset, SEEK_SET);
 
+	http_log("start writing. fseek:%d\n", rc);
 	for (i = 0; i < length; i+=2) {
 		memcpy(data, &write_data[i], 2);
-		x = (char)strtol(data, NULL, 10);
-		fwrite((char*)&x, 1, 1, fp);
+		x = strtol(data, &endptr, 16);
+		w = (char)x;
+		rc = fwrite(&w, 1, 1, fp);
+		http_log("%s %lx %x rc:%d\n", data, x, w, rc);
 	}
+	http_log("\n write over\n");
 	
 	fclose(fp);
 
@@ -237,6 +238,12 @@ int readblock(char *filepath, char *mount_point, unsigned long int offset, unsig
 
 	return 0;
 }
+
+int getdownload_process(void)
+{
+	return 0;
+}
+
 
 /***************************
 检查点读笔设备是否已经连接到USB且 已经挂载到/media/sda1
@@ -1591,10 +1598,9 @@ void* handler_request(void * arg)
 
 						//执行命令 用户查询进度条 开启下载线程 下载
 						
-						
 						sprintf(cmdbuf, "wget %s -P %s/%s", url, mount_point, dir);	//dir是U盘的相对路径
 						ret = system(cmdbuf);
-						if (ret != -1 && WIFEXITED(ret)) {
+						if (ret != 0 && WIFEXITED(ret)) {
 							http_log("Download Fail.Terminated with status: %d\n", WEXITSTATUS(ret) );
 							cJSON_AddStringToObject(json, "msg", "OK");
 							cJSON_AddStringToObject(json, "status", "fail");
@@ -1724,7 +1730,7 @@ readblock_response:
 						goto writeblock_response;
 					}
 					
-					length = strtol(length_str, &endptr, 10);
+					length = strtol(length_str, &endptr, 10);	//有无必要
 					if (length == LONG_MIN || length == LONG_MAX || (NULL != endptr && endptr != length_str+strlen(length_str))) {
 						http_log("str to long failed length:%p endptr:%p length:%ld\n", length_str, endptr, length);
 						cJSON_AddStringToObject(json, "msg", "OK");
@@ -1797,7 +1803,7 @@ changeme_response:
 						break;
 					}
 					
-					if (getdownload_process(vendor, model, rev)) {
+					if (getdownload_process()) {
 						cJSON_AddStringToObject(json, "msg", "OK");
 						cJSON_AddStringToObject(json, "status", "fail");
 						goto processbar_response;
@@ -2006,13 +2012,19 @@ int main()
 		int sock = accept(listen_sock, (struct sockaddr*)&client, &len);
 
 		if(sock < 0) {
+			http_log("accept fail %s.\n", strerror(errno));
 			continue;
 		}
-			
+
+		#if 0
 		pthread_t tid;
 		
 		pthread_create(&tid, NULL, handler_request, (void *)sock);
 		(void)pthread_detach(tid);
+		#endif
+		//在主线程中处理， 避免多线程操作
+		(void)handler_request((void *)sock);
+		sock = 0;	//已在handler_request释放
 	}
 	
 	return 0; 
