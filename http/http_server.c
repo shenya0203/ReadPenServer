@@ -14,7 +14,23 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <limits.h>
+#include<sys/types.h>
+#include<sys/wait.h>
+#include <arpa/inet.h>
+
+#include <netdb.h>
+#include <net/if.h>
+#include <arpa/inet.h>
+#include <sys/ioctl.h>
+#include <sys/types.h>
+#include <sys/socket.h>
 #include "cJSON.h"
+extern int h_errno;
+
+#define WAN_PORT "eth0"
+#define MAC_ADDR_LENGTH 18
+#define IP_ADDR_LENGTH 16
+#define WEB_CLOUD_ADDR "www.maiya.com"
 
 #define METHOD_OFFSET 5
 #define URL_TOKEN "url="
@@ -23,13 +39,18 @@
 #define ECHO_TOKEN "HTTP/1.0 200 ok\n\n"
 #define FILENAME_TOKEN "filename="
 #define OFFSET_TOKEN "org_offset="
-#define READ_BLOCK_LEN_TOKEN "len="
+#define BLOCK_LEN_TOKEN "len="
+#define WRITE_TOKEN "data="
+#define CHANGENAME_TOKEN "changedname="
 
 //需要MT7628保证只有一个USB口， 另外， 需要保证一定是挂载到/media/sda1上
+//问题：
+//确认： 1 在向点读笔中写入数据时，断开点读笔，会出现什么情况
 #define USB_MOUNT_PATH "/media/sda1"	//点读笔TF卡的挂载路径
 #define READ_PEN_DEVICE "/dev/sda1"
 
 #define DIR_MODE 0666
+
 
 #ifdef DEBUG
 #define http_log(fmt, ...) \
@@ -42,7 +63,122 @@ do {\
 
 pthread_mutex_t dir_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-char *opmethod[5] = { "download", "listfile", "readblock", "writeblock", "rename" };
+char *opmethod[] = { "download", "listfile", "readblock", "writeblock", "rename", "progressbar", "readpenid"};
+
+int writeblock(char *filepath, char *mount_point, unsigned long int offset, unsigned long int length, char *write_data)
+{
+	FILE *fp = NULL;
+	long f_len;
+	unsigned char data[3] = {0};
+	int i = 0;	
+	char realpathp[256];
+	long int x;
+	
+	//拼接文件路径
+	strcpy(realpathp, mount_point);
+	strcat(realpathp, "/");
+	strcat(realpathp, filepath);
+
+	fp = fopen(realpathp, "rb+");
+	if (NULL == fp) {
+		http_log("Open file %s failed !!!\n", realpathp);
+		return -1;
+	}
+
+	fseek(fp, 0, SEEK_END);
+	
+	f_len = ftell(fp);
+		
+	if (f_len < offset) {
+		http_log("offset is invalid!!!\n");
+		fclose(fp);
+		return -1;
+	}
+
+	for (i = 0; i < length; i+=2) {
+		memcpy(data, &write_data[i], 2);
+		x = (char)strtol(data, NULL, 10);
+		fwrite((char*)&x, 1, 1, fp);
+	}
+	
+	fclose(fp);
+
+	return 0;
+}
+
+int readpenid(char *vendor, char *model, char *rev)
+{
+	FILE *fp;
+	char buf[256];
+	char *ptr_vendor, *ptr_model, *ptr_rev, *ptr;
+#define VENDOR_TOKEN "Vendor:"
+#define MODEL_TOKEN "Model:"
+#define REV_TOKEN "Rev:"
+
+	fp = fopen("/proc/scsi/scsi", "r");
+
+	while (1) { 
+		ptr = fgets(buf, 256, fp);
+		if (NULL == ptr) {
+			break;
+		}
+		if ( strstr(buf, "Vendor:") != NULL) {
+			//Vendor: maiya    Model: 907              Rev: 2.14
+			ptr_vendor = strstr(buf, VENDOR_TOKEN);
+			ptr_model = strstr(buf, MODEL_TOKEN);
+			ptr_rev = strstr(buf, REV_TOKEN);
+			memcpy(vendor, ptr_vendor+strlen(VENDOR_TOKEN), ptr_model-ptr_vendor-strlen(VENDOR_TOKEN));
+			memcpy(model, ptr_model+strlen(MODEL_TOKEN), ptr_rev-ptr_model-strlen(MODEL_TOKEN));
+			memcpy(rev, ptr_rev+strlen(REV_TOKEN), buf+strlen(buf)-ptr_rev-strlen(REV_TOKEN));
+			
+			http_log("Vendor:%s Model:%s rev:%s\n", vendor, model, rev);
+			break;
+		}
+	}
+
+	fclose(fp);
+
+	if (ptr)
+		return 0;
+	
+	return -1;
+}
+
+
+int changename(char *filepath, char *mount_point, char *change)
+{
+	FILE *fp = NULL;
+	char oldpath[256], newpath[256];
+	int rc;
+	
+	//拼接文件路径
+	strcpy(oldpath, mount_point);
+	strcat(oldpath, "/");
+	strcat(oldpath, filepath);
+
+	fp = fopen(oldpath, "rb");
+	if (NULL == fp) {
+		http_log("Open file %s failed !!!\n", oldpath);
+		return -1;
+	}
+
+	fclose(fp);
+	
+	strcpy(newpath, mount_point);
+	strcat(newpath, "/");
+	strcat(newpath, change);
+
+	http_log("new path:%s old path:%s\n", newpath, oldpath);
+
+	rc = rename(oldpath, newpath);
+	if (rc) {
+		http_log("rename faile %s\n", strerror(errno));
+		return -1;
+	}
+
+	return 0;
+}
+
 
 int readblock(char *filepath, char *mount_point, unsigned long int offset, unsigned long int length, char *read_result)
 {	
@@ -235,6 +371,197 @@ fail:
 	return -1;
 }
 
+/**********************************************************
+函数名称：read_block_parse
+函数功能：解析read_block方法\			
+函数入参：getbuf: http://10.10.10.254:10008/writeblock?filename=/media/000.dab&org_offset=99&len=40&data=f4ba430012f8aba3a123705009c9e7aaabacadae&flag=end
+函数返回值：0 OK
+			1 FAIL
+			filename 返回解析得到的文件路径
+			offset 返回解析得到的 文件偏移量字符串
+			length 返回解析得到的 写入长度字符串
+			write_data 返回解析得到的 写入数据字符串
+			jquery 返回解析得到的jquery字符串
+**********************************************************/
+int write_block_parse(char *getbuf, char **filename, char **offset, char **length, char **write_data, char **jquery)
+{
+	char *ptr;
+	
+	if (ptr = strstr(getbuf, FILENAME_TOKEN)) {
+		*filename = ptr + strlen(FILENAME_TOKEN);
+	} else {
+		http_log("writeblock file token not exist.\n");
+		goto fail;
+	}
+	
+	if (ptr = strchr(*filename, '&')) { //从左向右找& 找到&后改为'\0'
+		*ptr = '\0';//截取filename字符串
+	} else {
+		http_log("writeblock http data format error. \n");
+		goto fail;
+	}
+
+	if (ptr = strstr(*filename+strlen(*filename)+1, OFFSET_TOKEN)) {
+		*offset = ptr + strlen(OFFSET_TOKEN);
+	} else {
+		http_log("writeblock offset token not exist.\n");
+		goto fail;
+	}
+	
+	if (ptr = strchr(*offset, '&')) {	//从左向右找& 找到&后改为'\0'
+		*ptr = '\0';//截取offset字符串
+	} else {
+		http_log("writeblock http data format error. \n");
+		goto fail;
+	}
+
+	if (ptr = strstr(*offset+strlen(*offset)+1, BLOCK_LEN_TOKEN)) {
+		*length = ptr + strlen(BLOCK_LEN_TOKEN);
+	} else {
+		http_log("writeblock offset not exit.\n");
+		goto fail;
+	}
+	
+	if (ptr = strchr(*length, '&')) {	//从左向右找& 找到&后改为'\0'
+		*ptr = '\0';//截取offset字符串
+	} else {
+		http_log("download dir str end not exist. \n");
+		goto fail;
+	}
+
+	if (ptr = strstr(*length+strlen(*length)+1, WRITE_TOKEN)) {
+		*write_data = ptr + strlen(WRITE_TOKEN);
+	} else {
+		http_log("writeblock write data not exist.\n");
+		goto fail;
+	}
+	
+	if (ptr = strchr(*write_data, '&')) {	//从左向右找& 找到&后改为'\0'
+		*ptr = '\0';//截取offset字符串
+	} else {
+		http_log("download dir str end not exist. \n");
+		goto fail;
+	}
+
+	if (ptr = strstr(*write_data+strlen(*write_data)+1, END_TOKEN)) {
+		*jquery = ptr + strlen(END_TOKEN) + 1;
+	} else {
+		http_log("GET END token not exit.\n");
+		goto fail;
+	}
+	
+	return 0;
+fail:
+	return -1;
+}
+
+/**********************************************************
+函数名称：process_bar_parse
+函数功能：解析process_bar方法\			
+函数入参：getbuf: http://10.10.10.254:10008/processbar?&flag=end
+函数返回值：0 OK
+			1 FAIL
+			jquery 返回解析得到的jquery字符串
+**********************************************************/
+int process_bar_parse(char *getbuf, char **jquery)
+{
+	char *ptr;
+	
+	if (ptr = strstr(getbuf, END_TOKEN)) {
+		*jquery = ptr + strlen(END_TOKEN) + 1;
+	} else {
+		http_log("readpenid Method GET END token not exit.\n");
+		goto fail;
+	}
+	
+	return 0;
+fail:
+	return -1;
+
+}
+
+
+/**********************************************************
+函数名称：readpenid_parse
+函数功能：解析readpenid方法\			
+函数入参：getbuf: http://10.10.10.254:10008/readpenid&flag=end
+函数返回值：0 OK
+			1 FAIL
+			jquery 返回解析得到的jquery字符串
+**********************************************************/
+int readpenid_parse(char *getbuf, char **jquery)
+{
+	char *ptr;
+	
+	if (ptr = strstr(getbuf, END_TOKEN)) {
+		*jquery = ptr + strlen(END_TOKEN) + 1;
+	} else {
+		http_log("readpenid Method GET END token not exit.\n");
+		goto fail;
+	}
+	
+	return 0;
+fail:
+	return -1;
+
+}
+
+
+/**********************************************************
+函数名称：rename_parse
+函数功能：解析rename_parse方法\			
+函数入参：getbuf: http://10.10.10.254:10008/rename?filename=/media/luke.txt&changedname=/media/luke123.bk&flag=end
+函数返回值：0 OK
+			1 FAIL
+			filename 返回解析得到的文件路径
+			changedname 返回解析得到的修改文件路径
+			jquery 返回解析得到的jquery字符串
+**********************************************************/
+int rename_parse(char *getbuf, char **filename, char **change, char **jquery)
+{
+	char *ptr;
+	
+	if (ptr = strstr(getbuf, FILENAME_TOKEN)) {
+		*filename = ptr + strlen(FILENAME_TOKEN);
+	} else {
+		http_log("rename filename not exist.\n");
+		goto fail;
+	}
+	
+	if (ptr = strchr(*filename, '&')) { //从左向右找& 找到&后改为'\0'
+		*ptr = '\0';//截取filename字符串
+	} else {
+		http_log("rename filename end mark not exist. \n");
+		goto fail;
+	}
+
+	if (ptr = strstr(*filename+strlen(*filename)+1, CHANGENAME_TOKEN)) {
+		*change = ptr + strlen(CHANGENAME_TOKEN);
+	} else {
+		http_log("rename change name path not exit.\n");
+		goto fail;
+	}
+	
+	if (ptr = strchr(*change, '&')) {	//从左向右找& 找到&后改为'\0'
+		*ptr = '\0';//截取changename字符串
+	} else {
+		http_log("rename change name path end mark not exist. \n");
+		goto fail;
+	}
+
+	if (ptr = strstr(*change+strlen(*change)+1, END_TOKEN)) {
+		*jquery = ptr + strlen(END_TOKEN) + 1;
+	} else {
+		http_log("GET END token not exit.\n");
+		goto fail;
+	}
+	
+	return 0;
+fail:
+	return -1;
+
+}
+
 
 
 /**********************************************************
@@ -278,8 +605,8 @@ int read_block_parse(char *getbuf, char **filename, char **offset, char **length
 		goto fail;
 	}
 
-	if (ptr = strstr(*offset+strlen(*offset)+1, READ_BLOCK_LEN_TOKEN)) {
-		*length = ptr + strlen(READ_BLOCK_LEN_TOKEN);
+	if (ptr = strstr(*offset+strlen(*offset)+1, BLOCK_LEN_TOKEN)) {
+		*length = ptr + strlen(BLOCK_LEN_TOKEN);
 	} else {
 		http_log("readblock offset not exit.\n");
 		goto fail;
@@ -324,7 +651,7 @@ int check_dir(char *dir, char *mount_point)
 		} 
 		
 		pthread_mutex_lock(&dir_mutex);
-		if (access(realpathp, F_OK) != 0 ) {	//查看目录结构是否存在
+		if (access(realpathp, F_OK) != 0 ) {	//查看目录结构是否存在, 不存在则创建
 			errno = 0;
 			
 			ret = mkdir(realpathp, DIR_MODE);				
@@ -1199,14 +1526,19 @@ void* handler_request(void * arg)
 	char mount_point[64];
 	char file_system_type[16];
 	
-	int sock = (int)arg;
-	int i = 0, ret;
+	int i = 0;
+	int ret;
 	char *url = NULL, *dir = NULL;
 	char *jquery = NULL;
 	char *json_ptr = NULL;
-	char *filename = NULL, *offset_str = NULL, *length_str = NULL, *read_result = NULL;
+	char *filename = NULL, *offset_str = NULL, *length_str = NULL, *read_result = NULL, *write_data = NULL, *change = NULL;
 	char *endptr;
 	long offset, length;
+	int sock = (int)arg;
+	
+	char vendor[32] = {0};
+	char model[32] = {0};
+	char rev[32] = {0};
 
 	char *device_status[] = {"true", "false"};
 	cJSON *json = cJSON_CreateObject();
@@ -1221,7 +1553,7 @@ void* handler_request(void * arg)
 		//"GET /download?url=http://maiya-1256866573.cos.ap-guangzhou.myqcloud.com/000.dab&dst_dir=/media&flag=end
 		if(0 == strncmp(buf, "GET", 3)) { //GET方法： GET  
 		
-			for(i = 0; i < 5; i++) {
+			for(i = 0; i < sizeof(opmethod)/sizeof(opmethod[i]); i++) {
 				if(0== strncmp(buf + METHOD_OFFSET, opmethod[i], strlen(opmethod[i]))) {
 					http_log("method : %s\n", opmethod[i]);
 					break;
@@ -1253,27 +1585,27 @@ void* handler_request(void * arg)
 							http_log("DIR Failed.\n");
 							cJSON_AddStringToObject(json, "msg", "OK");
 							cJSON_AddStringToObject(json, "status", "fail");
+							cJSON_AddStringToObject(json, "ErrorCode", "2");
 							goto download_response;
 						}
 
+						//执行命令 用户查询进度条 开启下载线程 下载
+						
+						
 						sprintf(cmdbuf, "wget %s -P %s/%s", url, mount_point, dir);	//dir是U盘的相对路径
-						system(cmdbuf);
+						ret = system(cmdbuf);
+						if (ret != -1 && WIFEXITED(ret)) {
+							http_log("Download Fail.Terminated with status: %d\n", WEXITSTATUS(ret) );
+							cJSON_AddStringToObject(json, "msg", "OK");
+							cJSON_AddStringToObject(json, "status", "fail");
+							goto download_response;
+						}
 						
 						cJSON_AddStringToObject(json, "msg", "OK");
 						cJSON_AddStringToObject(json, "status", "true");
 download_response:
 						json_ptr = cJSON_Print(json);
 						cJSON_Delete(json);
-						json = NULL;
-
-						#if 0
-						strcpy(response, ECHO_TOKEN);
-						strcat(response, jquery);
-						strcat(response, "(");
-						strcat(response, json_ptr);
-						strcat(response, ")");
-						#endif
-
 					}
 					break;
 				case 1: //list file
@@ -1313,7 +1645,6 @@ download_response:
 list_response:
 					json_ptr = cJSON_Print(json);
 					cJSON_Delete(json);
-					
 					break;
 				case 2: //read block and change data to ASCII string
 					//http://192.168.163.130:10008/readblock?filename=/DICT/000.dab&org_offset=99&len=20&flag=end
@@ -1373,9 +1704,137 @@ readblock_response:
 					free(read_result);
 					break;
 				case 3: //write block
+				
+					ret = write_block_parse(buf, &filename, &offset_str, &length_str, &write_data, &jquery);
+					if (ret < 0) {
+						http_log("Parse list Method Failed.\n");
+						break;
+					}
+					
+					http_log("filename:\n%s\n", filename);
+					http_log("offset:\n%s\n", offset_str);
+					http_log("length:\n%s\n", length_str);
+					http_log("write data:\n%s\n", write_data);
+					http_log("jquery:\n%s\n", jquery);
+					
+					if (CheckReadPen(mount_point, file_system_type)) {
+						http_log("ReadPen has not mounted to MT7628.\n");
+						cJSON_AddStringToObject(json, "msg", "OK");
+						cJSON_AddStringToObject(json, "status", "fail");
+						goto writeblock_response;
+					}
+					
+					length = strtol(length_str, &endptr, 10);
+					if (length == LONG_MIN || length == LONG_MAX || (NULL != endptr && endptr != length_str+strlen(length_str))) {
+						http_log("str to long failed length:%p endptr:%p length:%ld\n", length_str, endptr, length);
+						cJSON_AddStringToObject(json, "msg", "OK");
+						cJSON_AddStringToObject(json, "status", "fail");
+						goto writeblock_response;
+					}
+					
+					offset = strtol(offset_str, &endptr, 10);
+					if (offset == LONG_MIN || offset == LONG_MAX || (NULL != endptr && endptr != offset_str+strlen(offset_str))) {
+						http_log("str to long failed length:%p endptr:%p offset:%ld\n", length_str, endptr, offset);
+						cJSON_AddStringToObject(json, "msg", "OK");
+						cJSON_AddStringToObject(json, "status", "fail");
+						goto writeblock_response;
+					}
+
+					if (writeblock(filename, mount_point, offset, length, write_data) ) {
+						cJSON_AddStringToObject(json, "msg", "OK");
+						cJSON_AddStringToObject(json, "status", "fail");
+						goto writeblock_response;
+					}
+
+					cJSON_AddStringToObject(json, "msg", "OK");
+					cJSON_AddStringToObject(json, "status", "true");
+					
+writeblock_response:
+
+					json_ptr = cJSON_Print(json);
+
+					cJSON_Delete(json);
 					break;
 				case 4: //rename
+					//http://10.10.10.254:10008/rename?filename=/media/luke.txt&changedname=/media/luke123.bk&flag=end
 					
+					ret = rename_parse(buf, &filename, &change, &jquery);
+					if (ret < 0) {
+						http_log("ChangeNameS Method Failed.\n");
+						break;
+					}
+					
+					http_log("filename:\n%s\n", filename);
+					http_log("changename:\n%s\n", change);
+					http_log("jquery:\n%s\n", jquery);
+					
+					if (CheckReadPen(mount_point, file_system_type)) {
+						http_log("ReadPen has not mounted to MT7628.\n");
+						cJSON_AddStringToObject(json, "msg", "OK");
+						cJSON_AddStringToObject(json, "status", "fail");
+						goto changeme_response;
+					}
+					
+					if (changename(filename, mount_point, change) ) {
+						cJSON_AddStringToObject(json, "msg", "OK");
+						cJSON_AddStringToObject(json, "status", "fail");
+						goto changeme_response;
+					}
+
+					cJSON_AddStringToObject(json, "msg", "OK");
+					cJSON_AddStringToObject(json, "status", "true");
+					
+changeme_response:
+
+					json_ptr = cJSON_Print(json);
+
+					cJSON_Delete(json);
+					break;
+				case 5: //progress bar 进度条
+					ret = process_bar_parse(buf, &jquery);
+					if (ret < 0) {
+						http_log("Process Bar Method Failed.\n");
+						break;
+					}
+					
+					if (getdownload_process(vendor, model, rev)) {
+						cJSON_AddStringToObject(json, "msg", "OK");
+						cJSON_AddStringToObject(json, "status", "fail");
+						goto processbar_response;
+					}
+					
+					cJSON_AddStringToObject(json, "msg", "OK");
+					cJSON_AddStringToObject(json, "status", "true");
+processbar_response:
+					json_ptr = cJSON_Print(json);
+					
+					cJSON_Delete(json);
+					break;
+				case 6:	//readpenid 获取点读笔ID USB
+					{
+						ret = readpenid_parse(buf, &jquery);
+						if (ret < 0) {
+							http_log("ReadPenId Method Failed.\n");
+							break;
+						}
+
+						if (readpenid(vendor, model, rev)) {
+							cJSON_AddStringToObject(json, "msg", "OK");
+							cJSON_AddStringToObject(json, "status", "fail");
+							goto readpenid_response;
+						}
+						
+						cJSON_AddStringToObject(json, "msg", "OK");
+						cJSON_AddStringToObject(json, "status", "true");
+						cJSON_AddStringToObject(json, "vendor", vendor);
+						cJSON_AddStringToObject(json, "model", model);
+						cJSON_AddStringToObject(json, "rev", rev);
+	readpenid_response:
+						json_ptr = cJSON_Print(json);
+						
+						cJSON_Delete(json);
+						break;
+					}
 					break;
 				default:
 					break;
@@ -1405,9 +1864,140 @@ readblock_response:
 }
 #endif
 
-int main()
+
+int getnetinfo(char *mac, char *ip)
 {
+	struct ifreq ifreq;
+	int sock, i;
+	char *ptr;
+	struct sockaddr_in sin;
+	
+	if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+		return -1;
+	}
+	
+	strcpy(ifreq.ifr_name, WAN_PORT);
+	
+	if(ioctl(sock, SIOCGIFHWADDR, &ifreq) < 0) {	//获取MAC地址
+		http_log("Get MAC fail.\n ");
+		return -1;
+		close(sock);
+	}
+
+	ptr = mac;
+	for (i = 0; i < 6; i++) {
+		sprintf(ptr, "%02x", (unsigned char)ifreq.ifr_hwaddr.sa_data[i]);
+		if (i != 5) {
+			ptr += strlen(ptr);
+			sprintf(ptr, ":");
+			ptr += strlen(ptr);
+		}
+	}
+	
+	if (ioctl(sock, SIOCGIFADDR, &ifreq) < 0) {
+		http_log("ioctl error: %s\n", strerror(errno));
+		close(sock);
+		return -1;
+	}
+ 
+	memcpy(&sin, &ifreq.ifr_addr, sizeof(sin));
+	snprintf(ip, 17, "%s", inet_ntoa(sin.sin_addr));
+	
+	close(sock);
+	
+	return 0;
+}
+
+
+//集成到AIRKISS功能中
+void *update_server_task(void * arg)
+{
+	int rc;
+	int sock;
+	struct hostent *host = NULL;
+	struct sockaddr_in server;
+	char send_buf[256];
+	char mac[MAC_ADDR_LENGTH];
+	char ip[IP_ADDR_LENGTH];
+	char *ptr;
+	ssize_t r_s;
+
+	while (1) {
+		//几秒钟上报一次信息？？
+		if (getnetinfo(mac, ip) != 0) {
+			http_log("GET NET INFO FAIL ");
+			continue;
+		}
+
+		http_log("Report : MAC:%s IP:%s\n", mac, ip);
+
+		host = gethostbyname(WEB_CLOUD_ADDR);
+		if (host) {
+			if (host->h_addrtype == AF_INET && host->h_length == 4) {
+				server.sin_addr.s_addr = *(in_addr_t *)*(host->h_addr_list);
+				server.sin_family = AF_INET;
+				server.sin_port = htons(80); // 指定固定端口
+				http_log("%s %s\n", WEB_CLOUD_ADDR, inet_ntoa(server.sin_addr));
+			}
+		} else {
+			http_log("gethost fail : %s\n", hstrerror(h_errno));
+			continue;
+		}
+
+		ptr = send_buf;
+		sprintf(ptr, "%s", "GET /wifidevice.php?");
+		ptr += strlen(ptr);
+		sprintf(ptr, "mac=%s&ip=%s ", mac, ip);
+		ptr += strlen(ptr);
+		sprintf(ptr, "HTTP/1.1 \r\n"
+					 "Host: api.maiya.com\r\n"
+					 "Cache-Control: no-cache\r\n"
+					 "User-Agent: Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.77 Safari/537.36\r\n"
+					 "Accept: */*\r\n"
+					 "Accept-Encoding: gzip, deflater\r\n"
+					 "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8\r\n"
+					 "Connection: close\r\n\r\n"
+		);
+		http_log("%s\n", send_buf);
+
+		sock = socket(AF_INET, SOCK_STREAM, 0);
+		if(sock < 0) {	
+			http_log("create socket fail.\n");
+			continue;
+		}	
+
+		rc = connect(sock, (struct sockaddr *)&server, sizeof(server));
+		if (0 == rc) {
+			//发送GET命令？？？？
+			r_s = send(sock, send_buf, strlen(send_buf), 0);
+			http_log("%s send:%d.\n", WEB_CLOUD_ADDR, (int)r_s);
+				
+			close(sock);
+		}
+		sleep(500);
+	}
+	
+	return;
+}
+
+void *download_task(void * arg)
+{
+	while (1) {
+		
+	}
+}
+
+
+int main()
+{	
+	pthread_t update_tid, down_tid;
 	int listen_sock = startup();
+
+	pthread_create(&update_tid, NULL, update_server_task, NULL);
+	(void)pthread_detach(update_tid);
+
+	pthread_create(&down_tid, NULL, download_task, NULL);
+	(void)pthread_detach(down_tid);
 	
 	while(1) {
 		struct sockaddr_in client;
