@@ -24,10 +24,14 @@
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/prctl.h>
+
 #include "cJSON.h"
 extern int h_errno;
 
-#define WAN_PORT "eth0"
+#define WAN_PORT "apcli0"
+#define APCLI_INTERFACE "apcli0"
+
 #define MAC_ADDR_LENGTH 18
 #define IP_ADDR_LENGTH 16
 #define WEB_CLOUD_ADDR "www.maiya.com"
@@ -42,6 +46,8 @@ extern int h_errno;
 #define BLOCK_LEN_TOKEN "len="
 #define WRITE_TOKEN "data="
 #define CHANGENAME_TOKEN "changedname="
+#define CALLBACK_TOKEN "callback="
+#define HTTP_HEADER_TOKEN "HTTP/"
 
 //需要MT7628保证只有一个USB口， 另外， 需要保证一定是挂载到/media/sda1上
 //问题：
@@ -52,12 +58,14 @@ extern int h_errno;
 #define DIR_MODE 0666
 
 
-
+#define LOGFILE "/dev/console"
 
 #ifdef DEBUG
-#define http_log(fmt, ...) \
+#define http_log(fmt, arg...) \
 do {\
-	printf(fmt, ##__VA_ARGS__);\
+	FILE *log_fp = fopen(LOGFILE, "w+"); \
+	fprintf(log_fp, "%s:%s:%d:" fmt "\n", __FILE__, __func__, __LINE__, ##arg); \
+	fclose(log_fp); \
 } while (0)
 #else
 #define http_log(fmt, ...)
@@ -93,7 +101,7 @@ int writeblock(char *filepath, char *mount_point, unsigned long int offset, unsi
 	rc = fseek(fp, offset, SEEK_SET);
 
 	http_log("start writing. fseek:%d\n", rc);
-	for (i = 0; i < length; i+=2) {
+	for (i = 0; i < length*2; i+=2) {
 		memcpy(data, &write_data[i], 2);
 		x = strtol(data, &endptr, 16);
 		w = (char)x;
@@ -294,7 +302,7 @@ int CheckReadPen(char *point, char *type)
 	return 0;
 }
 
-int download_parse(char *getbuf, char **url, char **dir, char **jquery)
+int download_parse(char *getbuf, char **url, char **dir, char **jquery, char **http_header, char **filename)
 {
 	char *ptr;
 	
@@ -307,10 +315,16 @@ int download_parse(char *getbuf, char **url, char **dir, char **jquery)
 
 	if (ptr = strchr(*url, '&')) {
 		*ptr = '\0';//截取需要下载的url
+		
+		ptr = strrchr(*url, '/');
+		if (NULL != ptr) {
+			*filename = ptr+1;	//截取下载的文件名
+		}
 	} else {
 		http_log("download url end not exist .\n");
 		goto fail;
 	}
+	
 
 	if (ptr = strstr(*url+strlen(*url)+1, DIR_TOKEN)) {
 		*dir = ptr + strlen(DIR_TOKEN);
@@ -326,13 +340,27 @@ int download_parse(char *getbuf, char **url, char **dir, char **jquery)
 		goto fail;
 	}
 
-	if (ptr = strstr(*dir+strlen(*dir)+1, END_TOKEN)) {
-		*jquery = ptr + strlen(END_TOKEN) + 1;
+	if (ptr = strstr(*dir+strlen(*dir)+1, CALLBACK_TOKEN)) {
+		*jquery = ptr + strlen(CALLBACK_TOKEN) + 1;
 	} else {
-		http_log("GET END token not exit.\n");
+		http_log("GET callback token not exit.\n");
+		goto fail;
+	}
+
+	if (ptr = strchr(*jquery, '&')) {	//从左向右找& 找到&后改为'\0'
+		*ptr = '\0';
+	} else {
+		http_log("download callback str end not exist. \n");
 		goto fail;
 	}
 	
+	if (ptr = strstr(*jquery+strlen(*jquery)+1, HTTP_HEADER_TOKEN)) {
+		*http_header = ptr;
+	} else {
+		http_log("GET HTTP HEADER token not exit.\n");
+		goto fail;
+	}
+		
 	return 0;
 fail:
 	return -1;
@@ -348,7 +376,7 @@ fail:
 			dir 返回解析得到的目录字符串
 			jquery 返回解析得到的jquery字符串
 **********************************************************/
-int list_file_parse(char *getbuf, char **dir, char **jquery)
+int list_file_parse(char *getbuf, char **dir, char **jquery, char **http_header)
 {
 	char *ptr;
 	
@@ -366,10 +394,24 @@ int list_file_parse(char *getbuf, char **dir, char **jquery)
 		goto fail;
 	}
 
-	if (ptr = strstr(*dir+strlen(*dir)+1, END_TOKEN)) {
-		*jquery = ptr + strlen(END_TOKEN) + 1;
+	if (ptr = strstr(*dir+strlen(*dir)+1, CALLBACK_TOKEN)) {
+		*jquery = ptr + strlen(CALLBACK_TOKEN) + 1;
 	} else {
-		http_log("GET END token not exit.\n");
+		http_log("GET callback token not exit.\n");
+		goto fail;
+	}
+	
+	if (ptr = strchr(*jquery, '&')) {	//从左向右找& 找到&后改为'\0'
+		*ptr = '\0';//截取jquery
+	} else {
+		http_log("download callback str end not exist. \n");
+		goto fail;
+	}
+
+	if (ptr = strstr(*jquery+strlen(*jquery)+1, HTTP_HEADER_TOKEN)) {
+		*http_header = ptr;
+	} else {
+		http_log("GET HTTP HEADER token not exit.\n");
 		goto fail;
 	}
 	
@@ -390,7 +432,7 @@ fail:
 			write_data 返回解析得到的 写入数据字符串
 			jquery 返回解析得到的jquery字符串
 **********************************************************/
-int write_block_parse(char *getbuf, char **filename, char **offset, char **length, char **write_data, char **jquery)
+int write_block_parse(char *getbuf, char **filename, char **offset, char **length, char **write_data, char **jquery, char **http_header)
 {
 	char *ptr;
 	
@@ -450,10 +492,24 @@ int write_block_parse(char *getbuf, char **filename, char **offset, char **lengt
 		goto fail;
 	}
 
-	if (ptr = strstr(*write_data+strlen(*write_data)+1, END_TOKEN)) {
-		*jquery = ptr + strlen(END_TOKEN) + 1;
+	if (ptr = strstr(*write_data+strlen(*write_data)+1, CALLBACK_TOKEN)) {
+		*jquery = ptr + strlen(CALLBACK_TOKEN) + 1;
 	} else {
-		http_log("GET END token not exit.\n");
+		http_log("GET callback token not exit.\n");
+		goto fail;
+	}
+	
+	if (ptr = strchr(*jquery, '&')) {	//从左向右找& 找到&后改为'\0'
+		*ptr = '\0';//截取jquery
+	} else {
+		http_log("download callback str end not exist. \n");
+		goto fail;
+	}
+
+	if (ptr = strstr(*jquery+strlen(*jquery)+1, HTTP_HEADER_TOKEN)) {
+		*http_header = ptr;
+	} else {
+		http_log("GET HTTP HEADER token not exit.\n");
 		goto fail;
 	}
 	
@@ -496,14 +552,28 @@ fail:
 			1 FAIL
 			jquery 返回解析得到的jquery字符串
 **********************************************************/
-int readpenid_parse(char *getbuf, char **jquery)
+int readpenid_parse(char *getbuf, char **jquery, char **http_header)
 {
 	char *ptr;
 	
-	if (ptr = strstr(getbuf, END_TOKEN)) {
-		*jquery = ptr + strlen(END_TOKEN) + 1;
+	if (ptr = strstr(getbuf, CALLBACK_TOKEN)) {
+		*jquery = ptr + strlen(CALLBACK_TOKEN) + 1;
 	} else {
-		http_log("readpenid Method GET END token not exit.\n");
+		http_log("GET callback token not exit.\n");
+		goto fail;
+	}
+	
+	if (ptr = strchr(*jquery, '&')) {	//从左向右找& 找到&后改为'\0'
+		*ptr = '\0';//截取jquery
+	} else {
+		http_log("download callback str end not exist. \n");
+		goto fail;
+	}
+
+	if (ptr = strstr(*jquery+strlen(*jquery)+1, HTTP_HEADER_TOKEN)) {
+		*http_header = ptr;
+	} else {
+		http_log("GET HTTP HEADER token not exit.\n");
 		goto fail;
 	}
 	
@@ -524,7 +594,7 @@ fail:
 			changedname 返回解析得到的修改文件路径
 			jquery 返回解析得到的jquery字符串
 **********************************************************/
-int rename_parse(char *getbuf, char **filename, char **change, char **jquery)
+int rename_parse(char *getbuf, char **filename, char **change, char **jquery, char**http_header)
 {
 	char *ptr;
 	
@@ -556,10 +626,24 @@ int rename_parse(char *getbuf, char **filename, char **change, char **jquery)
 		goto fail;
 	}
 
-	if (ptr = strstr(*change+strlen(*change)+1, END_TOKEN)) {
-		*jquery = ptr + strlen(END_TOKEN) + 1;
+	if (ptr = strstr(*change+strlen(*change)+1, CALLBACK_TOKEN)) {
+		*jquery = ptr + strlen(CALLBACK_TOKEN) + 1;
 	} else {
-		http_log("GET END token not exit.\n");
+		http_log("GET callback token not exit.\n");
+		goto fail;
+	}
+	
+	if (ptr = strchr(*jquery, '&')) {	//从左向右找& 找到&后改为'\0'
+		*ptr = '\0';//截取jquery
+	} else {
+		http_log("download callback str end not exist. \n");
+		goto fail;
+	}
+
+	if (ptr = strstr(*jquery+strlen(*jquery)+1, HTTP_HEADER_TOKEN)) {
+		*http_header = ptr;
+	} else {
+		http_log("GET HTTP HEADER token not exit.\n");
 		goto fail;
 	}
 	
@@ -580,7 +664,7 @@ fail:
 			dir 返回解析得到的目录字符串
 			jquery 返回解析得到的jquery字符串
 **********************************************************/
-int read_block_parse(char *getbuf, char **filename, char **offset, char **length, char **jquery)
+int read_block_parse(char *getbuf, char **filename, char **offset, char **length, char **jquery, char **http_header)
 {
 	char *ptr;
 	
@@ -625,11 +709,25 @@ int read_block_parse(char *getbuf, char **filename, char **offset, char **length
 		http_log("download dir str end not exist. \n");
 		goto fail;
 	}
-
-	if (ptr = strstr(*length+strlen(*length)+1, END_TOKEN)) {
-		*jquery = ptr + strlen(END_TOKEN) + 1;
+	
+	if (ptr = strstr(*length+strlen(*length)+1, CALLBACK_TOKEN)) {
+		*jquery = ptr + strlen(CALLBACK_TOKEN) + 1;
 	} else {
-		http_log("GET END token not exit.\n");
+		http_log("GET callback token not exit.\n");
+		goto fail;
+	}
+	
+	if (ptr = strchr(*jquery, '&')) {	//从左向右找& 找到&后改为'\0'
+		*ptr = '\0';//截取jquery
+	} else {
+		http_log("download callback str end not exist. \n");
+		goto fail;
+	}
+
+	if (ptr = strstr(*jquery+strlen(*jquery)+1, HTTP_HEADER_TOKEN)) {
+		*http_header = ptr;
+	} else {
+		http_log("GET HTTP HEADER token not exit.\n");
 		goto fail;
 	}
 	
@@ -637,6 +735,38 @@ int read_block_parse(char *getbuf, char **filename, char **offset, char **length
 fail:
 	return -1;
 }
+
+void check_file(char *filename, char *mount_point, char *dir)
+{
+	int fd;
+	int ret;
+	char *ptr;
+	unsigned int offset = 1;	//不解析 根
+	
+	char realpathp[256];
+
+	
+	
+	//拼接目录路径
+	//strcpy(realpathp, USB_MOUNT_PATH);	//使用动态获取的路径 
+	strcpy(realpathp, mount_point);
+	strcat(realpathp, "/");
+	strcat(realpathp, dir);
+	strcat(realpathp, "/");
+	strcat(realpathp, filename);
+	http_log("----------------check %s has exist.-----------------\n", realpathp);
+
+	fd = open(realpathp, O_RDONLY);
+	if (fd > 0) {
+		http_log("%s is exist.\n", realpathp);
+		close(fd);
+		ret = unlink(realpathp);
+		http_log("unlink %s\n", realpathp);
+	}
+
+	return;
+}
+
 
 int check_dir(char *dir, char *mount_point)
 {
@@ -700,11 +830,13 @@ int startup(void)
 	int ret = bind(sock,(struct sockaddr *)&local,sizeof(local));
 	if( ret < 0 ) 
 	{   
+		http_log("bind fail.\n");
 		exit(2);
 	}   
 
 	if( listen(sock,5) < 0 ) 
 	{   
+		http_log("listen fail.\n");
 		exit(3);
 	}   
 	return sock;
@@ -1537,6 +1669,7 @@ void* handler_request(void * arg)
 	int ret;
 	char *url = NULL, *dir = NULL;
 	char *jquery = NULL;
+	char *http_header = NULL;
 	char *json_ptr = NULL;
 	char *filename = NULL, *offset_str = NULL, *length_str = NULL, *read_result = NULL, *write_data = NULL, *change = NULL;
 	char *endptr;
@@ -1555,22 +1688,27 @@ void* handler_request(void * arg)
 	ssize_t s = read(sock, buf,sizeof(buf)-1);	//读取客户端GET数据 
 	if( s > 0 ) {
 		buf[s] = 0;	//尾部补零 字符串形式
-		http_log("%s", buf);
+		//http_log("\n%s\n", buf);
 		
 		//"GET /download?url=http://maiya-1256866573.cos.ap-guangzhou.myqcloud.com/000.dab&dst_dir=/media&flag=end
 		if(0 == strncmp(buf, "GET", 3)) { //GET方法： GET  
 		
 			for(i = 0; i < sizeof(opmethod)/sizeof(opmethod[i]); i++) {
 				if(0== strncmp(buf + METHOD_OFFSET, opmethod[i], strlen(opmethod[i]))) {
-					http_log("method : %s\n", opmethod[i]);
+					http_log("\n----------------Method : %s---------------------\n", opmethod[i]);
 					break;
 				}
 			}
+			http_log("\n------------------------------------------------------------\n");
+			http_log("------------------------------------------------------------\n");
+			http_log("------------------------------------------------------------\n");
+			http_log("------------------------------------------------------------\n");
+			http_log("------------------------------------------------------------\n");
 		
 			switch (i) {
 				case 0: //download
 					{						
-						ret = download_parse(buf, &url, &dir, &jquery);
+						ret = download_parse(buf, &url, &dir, &jquery, &http_header, &filename);
 						if (ret < 0) {
 							http_log("Parse download Method Failed.\n");
 							//制造一个jquery
@@ -1578,8 +1716,10 @@ void* handler_request(void * arg)
 						}
 
 						http_log("url:\n%s\n", url);
+						http_log("filename:\n%s\n", filename);
 						http_log("dir:\n%s\n", dir);
 						http_log("jquery:\n%s\n", jquery);
+						http_log("http_header:\n%s\n", http_header);
 
 						if (CheckReadPen(mount_point, file_system_type)) {
 							http_log("ReadPen has not mounted to MT7628.\n");
@@ -1597,6 +1737,9 @@ void* handler_request(void * arg)
 						}
 
 						//执行命令 用户查询进度条 开启下载线程 下载
+						//文件名已存在 无法下载
+
+						check_file(filename, mount_point, dir);
 						
 						sprintf(cmdbuf, "wget %s -P %s/%s", url, mount_point, dir);	//dir是U盘的相对路径
 						ret = system(cmdbuf);
@@ -1604,6 +1747,7 @@ void* handler_request(void * arg)
 							http_log("Download Fail.Terminated with status: %d\n", WEXITSTATUS(ret) );
 							cJSON_AddStringToObject(json, "msg", "OK");
 							cJSON_AddStringToObject(json, "status", "fail");
+							cJSON_AddStringToObject(json, "download_status", "fail");
 							goto download_response;
 						}
 						
@@ -1616,7 +1760,7 @@ download_response:
 					break;
 				case 1: //list file
 					//http://192.168.163.130:10008/listfile?dst_dir=/media&flag=end
-					ret = list_file_parse(buf, &dir, &jquery);
+					ret = list_file_parse(buf, &dir, &jquery, &http_header);
 					if (ret < 0) {
 						http_log("Parse list Method Failed.\n");
 						break;
@@ -1624,6 +1768,7 @@ download_response:
 
 					http_log("dir:\n%s\n", dir);
 					http_log("jquery:\n%s\n", jquery);
+					http_log("http_header:\n%s\n", http_header);
 
 					if (CheckReadPen(mount_point, file_system_type)) {
 						http_log("ReadPen has not mounted to MT7628.\n");
@@ -1655,7 +1800,7 @@ list_response:
 				case 2: //read block and change data to ASCII string
 					//http://192.168.163.130:10008/readblock?filename=/DICT/000.dab&org_offset=99&len=20&flag=end
 					
-					ret = read_block_parse(buf, &filename, &offset_str, &length_str, &jquery);
+					ret = read_block_parse(buf, &filename, &offset_str, &length_str, &jquery, &http_header);
 					if (ret < 0) {
 						http_log("Parse list Method Failed.\n");
 						break;
@@ -1665,6 +1810,7 @@ list_response:
 					http_log("offset:\n%s\n", offset_str);
 					http_log("length:\n%s\n", length_str);
 					http_log("jquery:\n%s\n", jquery);
+					http_log("http_header:\n%s\n", http_header);
 
 					if (CheckReadPen(mount_point, file_system_type)) {
 						http_log("ReadPen has not mounted to MT7628.\n");
@@ -1711,7 +1857,7 @@ readblock_response:
 					break;
 				case 3: //write block
 				
-					ret = write_block_parse(buf, &filename, &offset_str, &length_str, &write_data, &jquery);
+					ret = write_block_parse(buf, &filename, &offset_str, &length_str, &write_data, &jquery, &http_header);
 					if (ret < 0) {
 						http_log("Parse list Method Failed.\n");
 						break;
@@ -1722,6 +1868,7 @@ readblock_response:
 					http_log("length:\n%s\n", length_str);
 					http_log("write data:\n%s\n", write_data);
 					http_log("jquery:\n%s\n", jquery);
+					http_log("http_header:\n%s\n", http_header);
 					
 					if (CheckReadPen(mount_point, file_system_type)) {
 						http_log("ReadPen has not mounted to MT7628.\n");
@@ -1764,7 +1911,7 @@ writeblock_response:
 				case 4: //rename
 					//http://10.10.10.254:10008/rename?filename=/media/luke.txt&changedname=/media/luke123.bk&flag=end
 					
-					ret = rename_parse(buf, &filename, &change, &jquery);
+					ret = rename_parse(buf, &filename, &change, &jquery, &http_header);
 					if (ret < 0) {
 						http_log("ChangeNameS Method Failed.\n");
 						break;
@@ -1773,6 +1920,7 @@ writeblock_response:
 					http_log("filename:\n%s\n", filename);
 					http_log("changename:\n%s\n", change);
 					http_log("jquery:\n%s\n", jquery);
+					http_log("http_header:\n%s\n", http_header);
 					
 					if (CheckReadPen(mount_point, file_system_type)) {
 						http_log("ReadPen has not mounted to MT7628.\n");
@@ -1818,11 +1966,15 @@ processbar_response:
 					break;
 				case 6:	//readpenid 获取点读笔ID USB
 					{
-						ret = readpenid_parse(buf, &jquery);
+						ret = readpenid_parse(buf, &jquery, &http_header);
 						if (ret < 0) {
 							http_log("ReadPenId Method Failed.\n");
 							break;
 						}
+
+						
+						http_log("jquery:\n%s\n", jquery);
+						http_log("http_header:\n%s\n", http_header);
 
 						if (readpenid(vendor, model, rev)) {
 							cJSON_AddStringToObject(json, "msg", "OK");
@@ -1848,10 +2000,11 @@ processbar_response:
 			
 			http_log("json string: %s; len = 0x%lu \n", json_ptr, strlen(json_ptr));
 
-			response = malloc(strlen(ECHO_TOKEN) + strlen(jquery) + strlen("(") + strlen(json_ptr) + strlen(")") + 1);
+			response = malloc(strlen(ECHO_TOKEN) + strlen(http_header) + strlen(jquery) + strlen("(") + strlen(json_ptr) + strlen(")") + 1);
 
 			//HTTP 响应
 			strcpy(response, ECHO_TOKEN);
+			strcat(response, http_header);
 			strcat(response, jquery);
 			strcat(response, "(");
 			strcat(response, json_ptr);
@@ -1870,6 +2023,7 @@ processbar_response:
 }
 #endif
 
+#define g_update_server_start = 0;
 
 int getnetinfo(char *mac, char *ip)
 {
@@ -1882,7 +2036,7 @@ int getnetinfo(char *mac, char *ip)
 		return -1;
 	}
 	
-	strcpy(ifreq.ifr_name, WAN_PORT);
+	strcpy(ifreq.ifr_name, APCLI_INTERFACE);
 	
 	if(ioctl(sock, SIOCGIFHWADDR, &ifreq) < 0) {	//获取MAC地址
 		http_log("Get MAC fail.\n ");
@@ -1914,83 +2068,158 @@ int getnetinfo(char *mac, char *ip)
 	return 0;
 }
 
-
-//集成到AIRKISS功能中
-void *update_server_task(void * arg)
+static int update_device_info(void)
 {
 	int rc;
 	int sock;
 	struct hostent *host = NULL;
 	struct sockaddr_in server;
-	char send_buf[256];
+	char send_buf[2048];
 	char mac[MAC_ADDR_LENGTH];
 	char ip[IP_ADDR_LENGTH];
 	char *ptr;
 	ssize_t r_s;
 
-	while (1) {
-		//几秒钟上报一次信息？？
-		if (getnetinfo(mac, ip) != 0) {
-			http_log("GET NET INFO FAIL ");
-			continue;
-		}
+	if (getnetinfo(mac, ip) != 0) {
+		http_log("GET NET INFO FAIL ");
+		return -1;
+	}
 
-		http_log("Report : MAC:%s IP:%s\n", mac, ip);
+	http_log("Report : MAC:%s IP:%s\n", mac, ip);
 
-		host = gethostbyname(WEB_CLOUD_ADDR);
-		if (host) {
-			if (host->h_addrtype == AF_INET && host->h_length == 4) {
-				server.sin_addr.s_addr = *(in_addr_t *)*(host->h_addr_list);
-				server.sin_family = AF_INET;
-				server.sin_port = htons(80); // 指定固定端口
-				http_log("%s %s\n", WEB_CLOUD_ADDR, inet_ntoa(server.sin_addr));
-			}
+	host = gethostbyname(WEB_CLOUD_ADDR);
+	if (host) {
+		if (host->h_addrtype == AF_INET && host->h_length == 4) {
+			server.sin_addr.s_addr = *(in_addr_t *)*(host->h_addr_list);
+			server.sin_family = AF_INET;
+			server.sin_port = htons(80); // 指定固定端口
+			http_log("%s %s\n", WEB_CLOUD_ADDR, inet_ntoa(server.sin_addr));
 		} else {
-			http_log("gethost fail : %s\n", hstrerror(h_errno));
-			continue;
+			http_log("Not Support ADDR Type\n");
+			return -1;
 		}
+	} else {
+		http_log("gethost fail : %s\n", hstrerror(h_errno));
+		return -1;
+	}
 
-		ptr = send_buf;
-		sprintf(ptr, "%s", "GET /wifidevice.php?");
-		ptr += strlen(ptr);
-		sprintf(ptr, "mac=%s&ip=%s ", mac, ip);
-		ptr += strlen(ptr);
-		sprintf(ptr, "HTTP/1.1 \r\n"
-					 "Host: api.maiya.com\r\n"
-					 "Cache-Control: no-cache\r\n"
-					 "User-Agent: Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.77 Safari/537.36\r\n"
-					 "Accept: */*\r\n"
-					 "Accept-Encoding: gzip, deflater\r\n"
-					 "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8\r\n"
-					 "Connection: close\r\n\r\n"
-		);
-		http_log("%s\n", send_buf);
+	ptr = send_buf;
+	sprintf(ptr, "%s", "GET /wifidevice.php?");
+	ptr += strlen(ptr);
+	sprintf(ptr, "mac=%s&ip=%s ", mac, ip);
+	ptr += strlen(ptr);
+	sprintf(ptr, "HTTP/1.1 \r\n"
+				 "Host: api.maiya.com\r\n"
+				 "Cache-Control: no-cache\r\n"
+				 "User-Agent: Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.77 Safari/537.36\r\n"
+				 "Accept: */*\r\n"
+				 "Accept-Encoding: gzip, deflater\r\n"
+				 "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8\r\n"
+				 "Connection: close\r\n\r\n"
+	);
+	http_log("%s\n", send_buf);
 
-		sock = socket(AF_INET, SOCK_STREAM, 0);
-		if(sock < 0) {	
-			http_log("create socket fail.\n");
-			continue;
-		}	
+	sock = socket(AF_INET, SOCK_STREAM, 0);
+	if(sock < 0) {	
+		http_log("create socket fail.\n");
+		return -1;
+	}	
 
-		rc = connect(sock, (struct sockaddr *)&server, sizeof(server));
-		if (0 == rc) {
-			//发送GET命令？？？？
-			r_s = send(sock, send_buf, strlen(send_buf), 0);
-			http_log("%s send:%d.\n", WEB_CLOUD_ADDR, (int)r_s);
-				
-			close(sock);
-		}
-		sleep(500);
+	rc = connect(sock, (struct sockaddr *)&server, sizeof(server));
+	if (rc != 0) {
+		close(sock);
+		return -1;
 	}
 	
-	return;
+	//发送GET命令？？？？
+	r_s = send(sock, send_buf, strlen(send_buf), 0);
+	
+	http_log("%s send:%d.\n", WEB_CLOUD_ADDR, (int)r_s);
+	
+	close(sock);
+	
+	return 0;
+}
+
+void *update_server_task(void * arg)
+{
+	do {
+		if (update_device_info() == 0) {
+			break;
+		}
+	} while (1);
+}
+
+static void update_server_proc(int sig)
+{
+	pthread_t update_tid;
+	
+	if (update_device_info()) {
+		//开启线程继续发送
+		pthread_create(&update_tid, NULL, update_server_task, NULL);
+		(void)pthread_detach(update_tid);
+	}
 }
 
 void *download_task(void * arg)
 {
+	prctl(PR_SET_NAME, (unsigned long)"download_task");
 	while (1) {
-		
+		pause();
 	}
+}
+
+static void signal_handle(void)
+{
+    signal(SIGUSR1, &update_server_proc);
+}
+
+#define PID_FILE "/var/run/hilink_server.pid"
+
+int lock_file(int fd)
+{
+	struct flock fl;
+	
+	fl.l_type = F_WRLCK;
+	fl.l_start = 0;
+	fl.l_whence = SEEK_SET;
+	fl.l_len = 0;
+	
+	return (fcntl(fd, F_SETLK, &fl));
+}
+
+static int runnind(void)
+{
+	int fd;
+	char buf[16];
+  
+	fd = open(PID_FILE, O_RDWR | O_CREAT, 0666);
+	if (fd < 0) {
+		http_log("open %s fail\n", PID_FILE);
+		exit(1);
+	}
+	
+	if (lock_file(fd) < 0) {
+		if (errno == EACCES || errno == EAGAIN) {
+			close(fd);
+			http_log("alone runnind\n");
+			return -1;
+		}
+		
+		printf("can't lock %s: %s\n", PID_FILE, strerror(errno));
+	}
+	
+	ftruncate(fd, 0);  //设置文件的大小为0
+	
+	sprintf(buf, "%ld", (long)getpid());
+	
+	write(fd, buf, strlen(buf) + 1);
+
+	close(fd);
+	http_log("close %s\n", PID_FILE);
+	
+	
+	return 0;
 }
 
 
@@ -1999,8 +2228,14 @@ int main()
 	pthread_t update_tid, down_tid;
 	int listen_sock = startup();
 
+	runnind();
+
+	signal_handle();
+
+#if 0
 	pthread_create(&update_tid, NULL, update_server_task, NULL);
 	(void)pthread_detach(update_tid);
+#endif
 
 	pthread_create(&down_tid, NULL, download_task, NULL);
 	(void)pthread_detach(down_tid);
